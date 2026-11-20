@@ -162,6 +162,8 @@ static std::wstring GetAppDataDir() {
 static std::wstring AppsPath()    { return GetAppDataDir() + L"\\apps.txt"; }
 static std::wstring ConfigPath()  { return GetAppDataDir() + L"\\config.txt"; }
 
+static void SyncAutoRunLnk();   // 前置声明：有启用软件时确保自启快捷方式存在
+
 static void LoadApps() {
     g_apps.clear();
     std::ifstream f(AppsPath().c_str(), std::ios::binary);
@@ -201,6 +203,7 @@ static void SaveApps() {
         f << WideToUtf8(it.name) << '\t' << WideToUtf8(it.path) << '\t'
           << it.days << '\t' << (it.enabled ? 1 : 0) << '\n';
     }
+    SyncAutoRunLnk();
 }
 
 static void LoadConfig() {
@@ -400,7 +403,22 @@ static bool InstallAutoRun() {
 }
 
 static void RemoveAutoRun() {
-    DeleteFileW(StartupLnkPath().c_str());
+    // 重试数次：文件可能被杀软/索引服务短暂占用
+    for (int i = 0; i < 5; i++) {
+        if (DeleteFileW(StartupLnkPath().c_str())) break;
+        Sleep(100);
+    }
+}
+
+// 根据软件清单自动维护启动文件夹快捷方式：有启用软件则存在，全部停用则移除
+static void SyncAutoRunLnk() {
+    bool anyEnabled = false;
+    for (const AppItem& a : g_apps)
+        if (a.enabled) { anyEnabled = true; break; }
+    if (anyEnabled && !IsAutoRunInstalled())
+        InstallAutoRun();
+    else if (!anyEnabled && IsAutoRunInstalled())
+        RemoveAutoRun();
 }
 
 // ------------------------------------------------------------
@@ -460,26 +478,45 @@ static HWND g_mainWnd = NULL;
 
 static void UpdateStatusText() {
     if (!g_mainWnd) return;
+    int enabledCount = 0;
+    for (const AppItem& a : g_apps)
+        if (a.enabled) enabledCount++;
     HWND st = GetDlgItem(g_mainWnd, IDC_STATUS);
     wchar_t buf[1024];
     swprintf(buf, 1024,
-             L"配置: %ls    |    开机自启: %ls    |    确认倒计时: %d 秒 %ls",
+             L"配置: %ls    |    参与开机启动: %d 个软件    |    启动快捷方式: %ls    |    确认倒计时: %d 秒 %ls",
              AppsPath().c_str(),
-             IsAutoRunInstalled() ? L"已开启" : L"未开启",
+             enabledCount,
+             IsAutoRunInstalled() ? L"已创建" : L"未创建",
              g_confirmSeconds,
              g_confirmSeconds == 0 ? L"(手动确认)" : L"(0 表示手动确认)");
     SetWindowTextW(st, buf);
-
-    HWND btn = GetDlgItem(g_mainWnd, IDC_AUTORUN);
-    SetWindowTextW(btn, IsAutoRunInstalled() ? L"移除开机自启" : L"设置开机自启");
 }
 
 static void UpdateButtons() {
     HWND lv = GetDlgItem(g_mainWnd, IDC_LIST);
-    int sel = ListView_GetNextItem(lv, -1, LVNI_SELECTED);
-    EnableWindow(GetDlgItem(g_mainWnd, IDC_EDIT), sel >= 0);
-    EnableWindow(GetDlgItem(g_mainWnd, IDC_DEL),  sel >= 0);
-    EnableWindow(GetDlgItem(g_mainWnd, IDC_RUN),  sel >= 0);
+    int selCount = 0;
+    bool allEnabled = true;
+    int s = -1;
+    while ((s = ListView_GetNextItem(lv, s, LVNI_SELECTED)) >= 0) {
+        selCount++;
+        LVITEMW vi = {0};
+        vi.mask = LVIF_PARAM;
+        vi.iItem = s;
+        ListView_GetItem(lv, &vi);
+        size_t idx = (size_t)vi.lParam;
+        if (idx < g_apps.size() && !g_apps[idx].enabled) allEnabled = false;
+    }
+    EnableWindow(GetDlgItem(g_mainWnd, IDC_EDIT), selCount == 1);
+    EnableWindow(GetDlgItem(g_mainWnd, IDC_DEL),  selCount >= 1);
+    EnableWindow(GetDlgItem(g_mainWnd, IDC_RUN),  selCount >= 1);
+    EnableWindow(GetDlgItem(g_mainWnd, IDC_AUTORUN), selCount >= 1);
+    // 按选中项的开机启动状态动态切换按钮文字
+    HWND btn = GetDlgItem(g_mainWnd, IDC_AUTORUN);
+    if (selCount == 0)
+        SetWindowTextW(btn, L"设置开机启动");
+    else
+        SetWindowTextW(btn, allEnabled ? L"移除开机启动" : L"设为开机启动");
 }
 
 static void RefreshList() {
@@ -500,7 +537,7 @@ static void RefreshList() {
         ListView_SetItemText(lv, row, 2, (LPWSTR)it.path.c_str());
         std::wstring plan = DaysText(it.days);
         ListView_SetItemText(lv, row, 3, (LPWSTR)plan.c_str());
-        ListView_SetItemText(lv, row, 4, (LPWSTR)(it.enabled ? L"启用" : L"停用"));
+        ListView_SetItemText(lv, row, 4, (LPWSTR)(it.enabled ? L"开机启动" : L"已停用"));
     }
     UpdateButtons();
     UpdateStatusText();
@@ -563,24 +600,47 @@ static void DoRunSelected() {
     MessageBoxW(g_mainWnd, msg, L"立即启动", MB_OK | MB_ICONINFORMATION);
 }
 
-static void ToggleAutoRun() {
-    if (IsAutoRunInstalled()) {
-        RemoveAutoRun();
-        MessageBoxW(g_mainWnd, L"已移除开机自启快捷方式。", L"开机自启", MB_OK | MB_ICONINFORMATION);
-    } else {
-        if (InstallAutoRun())
-            MessageBoxW(g_mainWnd, L"已创建开机自启快捷方式（带 --auto 参数）。", L"开机自启", MB_OK | MB_ICONINFORMATION);
-        else
-            MessageBoxW(g_mainWnd, L"创建快捷方式失败。", L"开机自启", MB_OK | MB_ICONERROR);
+// 批量设置/移除选中软件的开机启动（全部已启用 -> 移除；否则 -> 设为启用）
+static void ToggleAutoRunApps() {
+    HWND lv = GetDlgItem(g_mainWnd, IDC_LIST);
+    std::vector<size_t> rows;   // 应用索引
+    std::vector<int> selRows;   // 列表行号（用于保留选中）
+    int s = -1;
+    while ((s = ListView_GetNextItem(lv, s, LVNI_SELECTED)) >= 0) {
+        LVITEMW vi = {0};
+        vi.mask = LVIF_PARAM;
+        vi.iItem = s;
+        ListView_GetItem(lv, &vi);
+        rows.push_back((size_t)vi.lParam);
+        selRows.push_back(s);
     }
-    UpdateStatusText();
+    if (rows.empty()) return;
+    bool allEnabled = true;
+    for (size_t r : rows)
+        if (r >= g_apps.size() || !g_apps[r].enabled) { allEnabled = false; break; }
+    bool newVal = !allEnabled;
+    for (size_t r : rows) {
+        if (r >= g_apps.size()) continue;
+        g_apps[r].enabled = newVal;
+        if (newVal && g_apps[r].days <= 0) g_apps[r].days = 0x7F;
+    }
+    SaveApps();
+    RefreshList();
+    // 保留选中状态，便于继续批量操作
+    for (int row : selRows) {
+        LVITEMW st = {0};
+        st.stateMask = LVIS_SELECTED;
+        st.state = LVIS_SELECTED;
+        SendMessageW(lv, LVM_SETITEMSTATE, (WPARAM)row, (LPARAM)&st);
+    }
+    UpdateButtons();
 }
 
 static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
         g_mainWnd = hwnd;
-        DWORD lvStyle = LVS_REPORT | LVS_SHOWSELALWAYS | LVS_SINGLESEL;
+        DWORD lvStyle = LVS_REPORT | LVS_SHOWSELALWAYS;
         HWND lv = Mk(hwnd, WC_LISTVIEWW, L"", lvStyle, 0, 0, 100, 100, IDC_LIST);
         ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
         LVCOLUMNW col = {0};
@@ -599,7 +659,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         Mk(hwnd, L"BUTTON", L"编辑",       WS_TABSTOP | BS_PUSHBUTTON, 0,0,10,10, IDC_EDIT);
         Mk(hwnd, L"BUTTON", L"删除",       WS_TABSTOP | BS_PUSHBUTTON, 0,0,10,10, IDC_DEL);
         Mk(hwnd, L"BUTTON", L"立即启动",   WS_TABSTOP | BS_PUSHBUTTON, 0,0,10,10, IDC_RUN);
-        Mk(hwnd, L"BUTTON", L"设置开机自启", WS_TABSTOP | BS_PUSHBUTTON, 0,0,10,10, IDC_AUTORUN);
+        Mk(hwnd, L"BUTTON", L"设置开机启动", WS_TABSTOP | BS_PUSHBUTTON, 0,0,10,10, IDC_AUTORUN);
         Mk(hwnd, L"STATIC", L"", 0, 0,0,10,10, IDC_STATUS);
         RefreshList();
         PostMessageW(hwnd, WM_SIZE, 0, 0);
@@ -637,7 +697,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case IDC_DEL:    DoDelete(); break;
         case IDC_RUN:    DoRunSelected(); break;
-        case IDC_AUTORUN: ToggleAutoRun(); break;
+        case IDC_AUTORUN: ToggleAutoRunApps(); break;
         }
         return 0;
     }
