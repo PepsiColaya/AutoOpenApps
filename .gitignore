@@ -1,0 +1,33 @@
+# build outputs (any build*/dist*/ variant)
+build*/
+dist*/
+_old_*/
+_*.log
+*.log
+*.exe
+*.zip
+*.toc
+*.pkg
+*.pyz
+
+# python
+__pycache__/
+*.pyc
+
+# local dev/test artifacts
+test_out*.txt
+srv*.log
+srv2*.log
+build*.log
+exe*.log
+dbg*.log
+dbg*_out.txt
+debug_crash*.py
+
+# screenshot generator scratch
+_shot_tmp/
+
+# os
+Thumbs.db
+
+rebuild*.log
