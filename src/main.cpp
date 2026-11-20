@@ -1286,7 +1286,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         return 0;
     }
 
-    HWND w = CreateWindowExW(0, MAIN_CLASS, L"AutoOpenApps 软件管理 (C++ 原生版)",
+    HWND w = CreateWindowExW(0, MAIN_CLASS, L"AutoOpenApps 软件管理",
                              WS_OVERLAPPEDWINDOW,
                              CW_USEDEFAULT, CW_USEDEFAULT, ScaleI(940), ScaleI(620),
                              NULL, NULL, g_hInst, NULL);
